@@ -36,6 +36,12 @@ import {
   getEntry,
   reverseEntry,
 } from '../ledger/index.js';
+import {
+  getBalance as getUsageBalance,
+  getUsageSummary,
+  getUsageHistory as getUsageHistorySimple,
+  recordUsage,
+} from '../db/usage.js';
 
 // ============================================================================
 // Request/Response Utilities
@@ -140,6 +146,12 @@ const ROUTES = {
 
   // Health
   health: /^\/health$/,
+
+  // Simple Usage API (for CLI compatibility)
+  usageBalance: /^\/v1\/usage\/balance$/,
+  usage: /^\/v1\/usage$/,
+  usageHistory: /^\/v1\/usage\/history$/,
+  usageRecord: /^\/v1\/usage\/record$/,
 };
 
 // ============================================================================
@@ -468,6 +480,115 @@ async function handleReversal(
   sendJson(res, 201, { data: entry });
 }
 
+// ============================================================================
+// Simple Usage API Handlers (for CLI compatibility)
+// ============================================================================
+
+/**
+ * GET /v1/usage/balance
+ * Get current balance for org/user
+ * Query params: org_id (optional, defaults to 'default')
+ */
+async function handleUsageBalance(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const query = parseQueryParams(req.url || '');
+  const orgId = query.get('org_id') || 'default';
+
+  const balance = await getUsageBalance(orgId);
+  sendJson(res, 200, balance);
+}
+
+/**
+ * GET /v1/usage
+ * Get usage summary
+ * Query params: org_id (optional, defaults to 'default')
+ */
+async function handleUsageSummary(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const query = parseQueryParams(req.url || '');
+  const orgId = query.get('org_id') || 'default';
+
+  const summary = await getUsageSummary(orgId);
+  sendJson(res, 200, summary);
+}
+
+/**
+ * GET /v1/usage/history
+ * Get usage history with pagination
+ * Query params: org_id (optional), limit (default 50), offset (default 0)
+ */
+async function handleUsageHistorySimple(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const query = parseQueryParams(req.url || '');
+  const orgId = query.get('org_id') || 'default';
+
+  const limit = query.get('limit')
+    ? parseInt(query.get('limit')!, 10)
+    : 50;
+  const offset = query.get('offset')
+    ? parseInt(query.get('offset')!, 10)
+    : 0;
+
+  // Validate limit and offset
+  if (isNaN(limit) || limit < 1 || limit > 100) {
+    throw invalidRequest('limit must be between 1 and 100');
+  }
+  if (isNaN(offset) || offset < 0) {
+    throw invalidRequest('offset must be a non-negative integer');
+  }
+
+  const history = await getUsageHistorySimple(orgId, limit, offset);
+  sendJson(res, 200, history);
+}
+
+/**
+ * POST /v1/usage/record
+ * Record a usage event (internal)
+ */
+async function handleUsageRecord(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = parseJsonBody(await readBody(req));
+
+  if (typeof body !== 'object' || body === null) {
+    throw invalidRequest('Request body must be an object');
+  }
+
+  const data = body as Record<string, unknown>;
+
+  // Validate required fields
+  if (!data['org_id'] || typeof data['org_id'] !== 'string') {
+    throw invalidRequest('org_id is required and must be a string');
+  }
+  if (!data['action'] || typeof data['action'] !== 'string') {
+    throw invalidRequest('action is required and must be a string');
+  }
+  if (typeof data['credits_used'] !== 'number' || data['credits_used'] < 0) {
+    throw invalidRequest('credits_used is required and must be a non-negative number');
+  }
+
+  const result = await recordUsage({
+    org_id: data['org_id'] as string,
+    user_id: typeof data['user_id'] === 'string' ? data['user_id'] : undefined,
+    action: data['action'] as string,
+    credits_used: data['credits_used'] as number,
+    command: typeof data['command'] === 'string' ? data['command'] : undefined,
+    correlation_id: typeof data['correlation_id'] === 'string' ? data['correlation_id'] : undefined,
+    metadata: typeof data['metadata'] === 'object' && data['metadata'] !== null
+      ? data['metadata'] as Record<string, unknown>
+      : undefined,
+  });
+
+  sendJson(res, 201, result);
+}
+
 /**
  * GET /health
  * Health check endpoint
@@ -502,6 +623,27 @@ export async function handleRequest(
     // Health check
     if (method === 'GET' && ROUTES.health.test(path)) {
       await handleHealth(req, res);
+      return;
+    }
+
+    // Simple Usage API (for CLI compatibility)
+    if (method === 'GET' && ROUTES.usageBalance.test(path)) {
+      await handleUsageBalance(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.usage.test(path)) {
+      await handleUsageSummary(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.usageHistory.test(path)) {
+      await handleUsageHistorySimple(req, res);
+      return;
+    }
+
+    if (method === 'POST' && ROUTES.usageRecord.test(path)) {
+      await handleUsageRecord(req, res);
       return;
     }
 

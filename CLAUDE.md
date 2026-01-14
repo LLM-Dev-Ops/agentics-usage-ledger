@@ -21,8 +21,22 @@
 
 **Use this to prevent agent drift:**
 ```bash
+# Small teams (6-8 agents) - use hierarchical for tight control
 npx @claude-flow/cli@latest swarm init --topology hierarchical --max-agents 8 --strategy specialized
+
+# Large teams (10-15 agents) - use hierarchical-mesh for V3 queen + peer communication
+npx @claude-flow/cli@latest swarm init --topology hierarchical-mesh --max-agents 15 --strategy specialized
 ```
+
+**Valid Topologies:**
+- `hierarchical` - Queen controls workers directly (anti-drift for small teams)
+- `hierarchical-mesh` - V3 queen + peer communication (recommended for 10+ agents)
+- `mesh` - Fully connected peer network
+- `ring` - Circular communication pattern
+- `star` - Central coordinator with spokes
+- `hybrid` - Dynamic topology switching
+
+**Anti-Drift Guidelines:**
 - **hierarchical**: Coordinator catches divergence
 - **max-agents 6-8**: Smaller team = less drift
 - **specialized**: Clear roles, no overlap

@@ -23,13 +23,23 @@ let pool: Pool | null = null;
 export function initDb(): Pool {
   if (pool) return pool;
 
+  // Support multiple environment variable naming conventions
+  const host = process.env['USAGE_DB_HOST'] || process.env['PGHOST'] || process.env['DATABASE_HOST'] || 'localhost';
+  const port = parseInt(process.env['USAGE_DB_PORT'] || process.env['PGPORT'] || process.env['DATABASE_PORT'] || '5432', 10);
+  const database = process.env['USAGE_DB_NAME'] || process.env['PGDATABASE'] || process.env['DATABASE_NAME'] || 'usage-ledger';
+  const user = process.env['USAGE_DB_USER'] || process.env['PGUSER'] || process.env['DATABASE_USER'] || 'postgres';
+  const password = process.env['USAGE_DB_PASSWORD'] || process.env['PGPASSWORD'] || process.env['DATABASE_PASSWORD'] || '';
+  const ssl = process.env['DATABASE_SSL'] === 'true' ? { rejectUnauthorized: false } : undefined;
+
+  console.log(`Connecting to database at ${host}:${port}/${database}`);
+
   pool = new Pool({
-    host: process.env['PGHOST'] || process.env['DATABASE_HOST'] || 'localhost',
-    port: parseInt(process.env['PGPORT'] || process.env['DATABASE_PORT'] || '5432', 10),
-    database: process.env['PGDATABASE'] || process.env['DATABASE_NAME'] || 'agentics',
-    user: process.env['PGUSER'] || process.env['DATABASE_USER'] || 'postgres',
-    password: process.env['PGPASSWORD'] || process.env['DATABASE_PASSWORD'] || '',
-    ssl: process.env['DATABASE_SSL'] === 'true' ? { rejectUnauthorized: false } : undefined,
+    host,
+    port,
+    database,
+    user,
+    password,
+    ssl,
     max: parseInt(process.env['DATABASE_POOL_SIZE'] || '20', 10),
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,

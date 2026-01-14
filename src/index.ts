@@ -14,6 +14,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
 import { initDb, closeDb } from './db/index.js';
+import { setupUsageSchema } from './db/setup.js';
 import { handleRequest } from './api/handlers.js';
 
 const PORT = parseInt(process.env['PORT'] || '3000', 10);
@@ -26,6 +27,14 @@ async function start(): Promise<void> {
   // Initialize database connection pool
   console.log('Initializing database connection...');
   initDb();
+
+  // Setup usage schema (create tables if needed)
+  try {
+    await setupUsageSchema();
+  } catch (error) {
+    console.warn('Warning: Could not setup usage schema:', (error as Error).message);
+    console.warn('Usage endpoints may not work until database is configured');
+  }
 
   // Create HTTP server
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -80,6 +89,12 @@ async function start(): Promise<void> {
     console.log(`agentics-usage-ledger listening on ${HOST}:${PORT}`);
     console.log('Endpoints:');
     console.log('  GET  /health');
+    console.log('  -- Simple Usage API (CLI compatible) --');
+    console.log('  GET  /v1/usage/balance');
+    console.log('  GET  /v1/usage');
+    console.log('  GET  /v1/usage/history');
+    console.log('  POST /v1/usage/record');
+    console.log('  -- Full Ledger API --');
     console.log('  GET  /v1/organizations/{org_id}/balance');
     console.log('  POST /v1/organizations/{org_id}/can-execute');
     console.log('  GET  /v1/organizations/{org_id}/entries');
