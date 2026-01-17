@@ -173,3 +173,93 @@ export interface PaginatedResponse<T> {
   offset: number;
   has_more: boolean;
 }
+
+// ============================================================================
+// Entitlements Types
+// ============================================================================
+
+/**
+ * Entitlement status for command access
+ */
+export type EntitlementStatus = 'enabled' | 'disabled' | 'suspended';
+
+/**
+ * Command entitlement record - maps org to allowed commands
+ */
+export interface CommandEntitlement {
+  entitlement_id: string;
+  organization_id: string;
+  command_name: string;
+  status: EntitlementStatus;
+  credits_per_use: number;
+  daily_limit: number | null;
+  monthly_limit: number | null;
+  metadata: Record<string, unknown>;
+  created_at: Date;
+  updated_at: Date;
+}
+
+/**
+ * Request to check if a command is allowed
+ */
+export interface CommandCheckRequest {
+  organization_id: string;
+  command_name: string;
+  user_id?: string;
+}
+
+/**
+ * Response for command entitlement check
+ */
+export interface CommandCheckResponse {
+  allowed: boolean;
+  organization_id: string;
+  command_name: string;
+  credits_per_use: number;
+  reason?: string;
+  daily_usage?: number;
+  daily_limit?: number | null;
+  monthly_usage?: number;
+  monthly_limit?: number | null;
+}
+
+/**
+ * Usage record request for command execution
+ */
+export interface CommandUsageRequest {
+  organization_id: string;
+  user_id?: string;
+  command_name: string;
+  success: boolean;
+  credits_used?: number;
+  execution_time_ms?: number;
+  correlation_id?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Usage record response
+ */
+export interface CommandUsageRecord {
+  usage_id: string;
+  organization_id: string;
+  user_id: string | null;
+  command_name: string;
+  credits_used: number;
+  success: boolean;
+  execution_time_ms: number | null;
+  correlation_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: Date;
+}
+
+/**
+ * Command usage statistics
+ */
+export interface CommandUsageStats {
+  organization_id: string;
+  command_name: string;
+  daily_count: number;
+  monthly_count: number;
+  total_credits_used: number;
+}

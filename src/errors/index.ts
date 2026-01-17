@@ -19,7 +19,13 @@ export type LedgerErrorCode =
   | 'PERMISSION_DENIED'
   | 'RATE_LIMITED'
   | 'INVALID_REQUEST'
-  | 'INTERNAL_ERROR';
+  | 'INTERNAL_ERROR'
+  | 'COMMAND_NOT_ENTITLED'
+  | 'ENTITLEMENT_SUSPENDED'
+  | 'DAILY_LIMIT_EXCEEDED'
+  | 'MONTHLY_LIMIT_EXCEEDED'
+  | 'UNAUTHENTICATED'
+  | 'PRINCIPAL_NOT_MAPPED';
 
 const HTTP_STATUS_MAP: Record<LedgerErrorCode, number> = {
   ORGANIZATION_NOT_FOUND: 404,
@@ -38,6 +44,12 @@ const HTTP_STATUS_MAP: Record<LedgerErrorCode, number> = {
   RATE_LIMITED: 429,
   INVALID_REQUEST: 400,
   INTERNAL_ERROR: 500,
+  COMMAND_NOT_ENTITLED: 403,
+  ENTITLEMENT_SUSPENDED: 403,
+  DAILY_LIMIT_EXCEEDED: 429,
+  MONTHLY_LIMIT_EXCEEDED: 429,
+  UNAUTHENTICATED: 401,
+  PRINCIPAL_NOT_MAPPED: 403,
 };
 
 /**
@@ -210,5 +222,87 @@ export function internalError(): LedgerError {
     'INTERNAL_ERROR',
     'An internal error occurred',
     {}
+  );
+}
+
+// ============================================================================
+// Entitlement Errors
+// ============================================================================
+
+export function commandNotEntitled(
+  orgId: string,
+  commandName: string
+): LedgerError {
+  return new LedgerError(
+    'COMMAND_NOT_ENTITLED',
+    'Your organization is not entitled to run this command.',
+    { organization_id: orgId, command_name: commandName }
+  );
+}
+
+export function entitlementSuspended(
+  orgId: string,
+  commandName: string
+): LedgerError {
+  return new LedgerError(
+    'ENTITLEMENT_SUSPENDED',
+    'Your entitlement to this command has been suspended.',
+    { organization_id: orgId, command_name: commandName }
+  );
+}
+
+export function dailyLimitExceeded(
+  orgId: string,
+  commandName: string,
+  currentUsage: number,
+  limit: number
+): LedgerError {
+  return new LedgerError(
+    'DAILY_LIMIT_EXCEEDED',
+    'Daily usage limit exceeded for this command.',
+    {
+      organization_id: orgId,
+      command_name: commandName,
+      daily_usage: currentUsage,
+      daily_limit: limit,
+    }
+  );
+}
+
+export function monthlyLimitExceeded(
+  orgId: string,
+  commandName: string,
+  currentUsage: number,
+  limit: number
+): LedgerError {
+  return new LedgerError(
+    'MONTHLY_LIMIT_EXCEEDED',
+    'Monthly usage limit exceeded for this command.',
+    {
+      organization_id: orgId,
+      command_name: commandName,
+      monthly_usage: currentUsage,
+      monthly_limit: limit,
+    }
+  );
+}
+
+// ============================================================================
+// Authentication Errors
+// ============================================================================
+
+export function unauthenticated(reason?: string): LedgerError {
+  return new LedgerError(
+    'UNAUTHENTICATED',
+    reason || 'Authentication required. Cloud Run IAM authentication expected.',
+    {}
+  );
+}
+
+export function principalNotMapped(principalEmail: string): LedgerError {
+  return new LedgerError(
+    'PRINCIPAL_NOT_MAPPED',
+    'Principal is not mapped to any organization. Contact administrator.',
+    { principal_email: principalEmail }
   );
 }

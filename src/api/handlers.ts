@@ -2,13 +2,32 @@
  * HTTP API handlers for agentics-usage-ledger
  * Per SPARC Specification Section 3.3.1 (REST API)
  *
- * Assumes caller has already been authenticated by the platform.
- * Authorization boundaries are enforced by org_id in path.
+ * SECURITY MODEL (Cloud Run IAM):
+ * - Cloud Run handles token validation (signature, expiration, audience)
+ * - This service extracts principal from validated token
+ * - org_id is resolved server-side from principal (NEVER from client)
+ * - All usage writes require authenticated principal
+ *
+ * NON-NEGOTIABLE:
+ * - NO JWT validation (Cloud Run handles this)
+ * - NO API keys
+ * - NO trusting client-supplied org_id or user_id for writes
  */
 
 import type { IncomingMessage, ServerResponse } from 'http';
 import type { EntryType } from '../types/index.js';
-import { LedgerError, invalidRequest, internalError } from '../errors/index.js';
+import {
+  LedgerError,
+  invalidRequest,
+  internalError,
+  unauthenticated,
+  principalNotMapped,
+} from '../errors/index.js';
+import {
+  authenticateAndAuthorize,
+  type AuthenticatedContext,
+  shouldEnforceAuth,
+} from '../auth/index.js';
 import {
   validateUuid,
   validatePositiveAmount,
@@ -35,6 +54,11 @@ import {
   getUsageHistory,
   getEntry,
   reverseEntry,
+  isCommandAllowed,
+  recordCommandExecution,
+  getOrgEntitlements,
+  getEntitledCommands,
+  initializeOrgEntitlements,
 } from '../ledger/index.js';
 import {
   getBalance as getUsageBalance,
@@ -42,6 +66,15 @@ import {
   getUsageHistory as getUsageHistorySimple,
   recordUsage,
 } from '../db/usage.js';
+import {
+  getUsageSummary as getOrgUsageSummary,
+  getUsageByCommand,
+  getUsageByUser,
+  getUsageByDay,
+  getRecentActivity,
+  getTopCommands,
+  getTopUsers,
+} from '../db/usage-queries.js';
 
 // ============================================================================
 // Request/Response Utilities
@@ -102,16 +135,44 @@ function sendError(res: ServerResponse, error: LedgerError): void {
 }
 
 /**
- * Get actor from request headers
- * Assumes platform has authenticated and set X-Actor header
+ * Get actor from request headers (DEPRECATED for writes)
+ * For read-only operations where auth is optional
  */
 function getActor(req: IncomingMessage): string {
   const actor = req.headers['x-actor'];
   if (typeof actor === 'string' && actor.trim()) {
     return actor.trim();
   }
-  // Default to service actor if not provided (internal calls)
   return 'service:usage-ledger';
+}
+
+/**
+ * Require authentication and return context
+ * Throws if not authenticated or principal cannot be mapped
+ */
+async function requireAuth(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<AuthenticatedContext | null> {
+  const authResult = await authenticateAndAuthorize(req);
+
+  if (!authResult.authenticated || !authResult.context) {
+    // Determine if this is an auth failure or mapping failure
+    if (authResult.error?.includes('not mapped')) {
+      throw principalNotMapped(authResult.error);
+    }
+    throw unauthenticated(authResult.error);
+  }
+
+  return authResult.context;
+}
+
+/**
+ * Get actor string from authenticated context
+ * Format: "principal:{email}"
+ */
+function getActorFromContext(ctx: AuthenticatedContext): string {
+  return `principal:${ctx.principal.email}`;
 }
 
 // ============================================================================
@@ -152,6 +213,25 @@ const ROUTES = {
   usage: /^\/v1\/usage$/,
   usageHistory: /^\/v1\/usage\/history$/,
   usageRecord: /^\/v1\/usage\/record$/,
+
+  // Entitlements API (for command authorization)
+  entitlements: /^\/v1\/organizations\/(?<org_id>[^/]+)\/entitlements$/,
+  entitlementCommands: /^\/v1\/organizations\/(?<org_id>[^/]+)\/entitlements\/commands$/,
+  entitlementCommand: /^\/v1\/organizations\/(?<org_id>[^/]+)\/entitlements\/commands\/(?<command_name>[^/]+)$/,
+
+  // CLI-compatible Entitlement API
+  canExecuteCommand: /^\/v1\/entitlements\/can-execute$/,
+  recordExecution: /^\/v1\/entitlements\/record$/,
+  entitledCommandsList: /^\/v1\/entitlements\/commands$/,
+
+  // Usage Query Endpoints (UI Backend - IAM-secured)
+  usageQuerySummary: /^\/usage\/summary$/,
+  usageQueryByCommand: /^\/usage\/by-command$/,
+  usageQueryByUser: /^\/usage\/by-user$/,
+  usageQueryByDay: /^\/usage\/by-day$/,
+  usageQueryRecent: /^\/usage\/recent$/,
+  usageQueryTopCommands: /^\/usage\/top-commands$/,
+  usageQueryTopUsers: /^\/usage\/top-users$/,
 };
 
 // ============================================================================
@@ -549,12 +629,24 @@ async function handleUsageHistorySimple(
 
 /**
  * POST /v1/usage/record
- * Record a usage event (internal)
+ * Record a usage event
+ *
+ * SECURITY: All usage writes require Cloud Run IAM authentication
+ * - org_id is resolved from authenticated principal (NOT from client)
+ * - user_id is set to authenticated principal (NOT from client)
+ * - Client-supplied identity fields are IGNORED
  */
 async function handleUsageRecord(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
+  // STEP 1: Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) {
+    return; // Error already sent
+  }
+
+  // STEP 2: Parse request body
   const body = parseJsonBody(await readBody(req));
 
   if (typeof body !== 'object' || body === null) {
@@ -563,10 +655,7 @@ async function handleUsageRecord(
 
   const data = body as Record<string, unknown>;
 
-  // Validate required fields
-  if (!data['org_id'] || typeof data['org_id'] !== 'string') {
-    throw invalidRequest('org_id is required and must be a string');
-  }
+  // Validate required fields (org_id NOT required - comes from auth)
   if (!data['action'] || typeof data['action'] !== 'string') {
     throw invalidRequest('action is required and must be a string');
   }
@@ -574,19 +663,32 @@ async function handleUsageRecord(
     throw invalidRequest('credits_used is required and must be a non-negative number');
   }
 
+  // STEP 3: Record usage with authenticated org_id and principal
+  // Client-supplied org_id and user_id are IGNORED
   const result = await recordUsage({
-    org_id: data['org_id'] as string,
-    user_id: typeof data['user_id'] === 'string' ? data['user_id'] : undefined,
+    org_id: authContext.organization_id, // From server-side mapping
+    user_id: authContext.principal.email, // Authenticated GCP identity
     action: data['action'] as string,
     credits_used: data['credits_used'] as number,
     command: typeof data['command'] === 'string' ? data['command'] : undefined,
     correlation_id: typeof data['correlation_id'] === 'string' ? data['correlation_id'] : undefined,
-    metadata: typeof data['metadata'] === 'object' && data['metadata'] !== null
-      ? data['metadata'] as Record<string, unknown>
-      : undefined,
+    metadata: {
+      // Include audit metadata
+      principal: authContext.principal.email,
+      principal_subject: authContext.principal.subject,
+      mapping_source: authContext.mapping_source,
+      // Include any client-provided metadata
+      ...(typeof data['metadata'] === 'object' && data['metadata'] !== null
+        ? data['metadata'] as Record<string, unknown>
+        : {}),
+    },
   });
 
-  sendJson(res, 201, result);
+  sendJson(res, 201, {
+    ...result,
+    principal: authContext.principal.email,
+    organization_id: authContext.organization_id,
+  });
 }
 
 /**
@@ -601,6 +703,517 @@ async function handleHealth(
     status: 'healthy',
     service: 'agentics-usage-ledger',
     timestamp: new Date().toISOString(),
+  });
+}
+
+// ============================================================================
+// Entitlement API Handlers
+// ============================================================================
+
+/**
+ * GET /v1/organizations/{org_id}/entitlements
+ * Get all entitlements for an organization
+ */
+async function handleGetEntitlements(
+  req: IncomingMessage,
+  res: ServerResponse,
+  params: { [key: string]: string }
+): Promise<void> {
+  const orgId = params['org_id']!;
+  const entitlements = await getOrgEntitlements(orgId);
+  sendJson(res, 200, { data: entitlements });
+}
+
+/**
+ * POST /v1/organizations/{org_id}/entitlements
+ * Initialize default entitlements for an organization
+ */
+async function handleInitEntitlements(
+  req: IncomingMessage,
+  res: ServerResponse,
+  params: { [key: string]: string }
+): Promise<void> {
+  const orgId = params['org_id']!;
+  await initializeOrgEntitlements(orgId);
+  const entitlements = await getOrgEntitlements(orgId);
+  sendJson(res, 201, { data: entitlements, message: 'Entitlements initialized' });
+}
+
+/**
+ * GET /v1/organizations/{org_id}/entitlements/commands
+ * List all commands that require entitlements
+ */
+async function handleGetEntitledCommands(
+  req: IncomingMessage,
+  res: ServerResponse,
+  params: { [key: string]: string }
+): Promise<void> {
+  const commands = getEntitledCommands();
+  sendJson(res, 200, { data: commands });
+}
+
+/**
+ * GET /v1/organizations/{org_id}/entitlements/commands/{command_name}
+ * Check if a specific command is allowed
+ */
+async function handleCheckCommand(
+  req: IncomingMessage,
+  res: ServerResponse,
+  params: { [key: string]: string }
+): Promise<void> {
+  const orgId = params['org_id']!;
+  const commandName = decodeURIComponent(params['command_name']!);
+  const query = parseQueryParams(req.url || '');
+  const userId = query.get('user_id') || undefined;
+
+  const result = await isCommandAllowed({
+    organization_id: orgId,
+    command_name: commandName,
+    user_id: userId,
+  });
+
+  // Return 200 with allowed status (not 403) so CLI can handle the response
+  sendJson(res, 200, { data: result });
+}
+
+/**
+ * POST /v1/entitlements/can-execute
+ * CLI-compatible endpoint: Check if a command is allowed
+ *
+ * SECURITY: This is the main entitlement gate for the CLI
+ * - REQUIRES Cloud Run IAM authentication
+ * - org_id is resolved from authenticated principal (NOT from client)
+ * - Client-supplied org_id is IGNORED
+ *
+ * Flow:
+ * 1. Authenticate request (Cloud Run validates token)
+ * 2. Extract principal email from token
+ * 3. Resolve org_id from principal (server-side mapping)
+ * 4. Check entitlement for resolved org_id
+ */
+async function handleCanExecuteCommand(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // STEP 1: Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) {
+    return; // Error already sent
+  }
+
+  // STEP 2: Parse request body
+  const body = parseJsonBody(await readBody(req));
+
+  if (typeof body !== 'object' || body === null) {
+    throw invalidRequest('Request body must be an object');
+  }
+
+  const data = body as Record<string, unknown>;
+
+  // Validate required field (only command_name - org_id comes from auth)
+  if (!data['command_name'] || typeof data['command_name'] !== 'string') {
+    throw invalidRequest('command_name is required and must be a string');
+  }
+
+  // STEP 3: Use org_id from authenticated context (NOT from client)
+  // Client-supplied org_id is IGNORED for security
+  const result = await isCommandAllowed({
+    organization_id: authContext.organization_id, // From server-side mapping
+    command_name: data['command_name'] as string,
+    user_id: authContext.principal.email, // Use authenticated principal
+  });
+
+  // If not allowed, return 403 with structured error for CLI
+  if (!result.allowed) {
+    sendJson(res, 403, {
+      error: {
+        code: 'ACCESS_DENIED',
+        message: result.reason || 'Your organization is not entitled to run this command.',
+        details: {
+          organization_id: result.organization_id,
+          command_name: result.command_name,
+          principal: authContext.principal.email,
+          daily_usage: result.daily_usage,
+          daily_limit: result.daily_limit,
+          monthly_usage: result.monthly_usage,
+          monthly_limit: result.monthly_limit,
+        },
+      },
+    });
+    return;
+  }
+
+  // Command is allowed - include principal in response
+  sendJson(res, 200, {
+    data: {
+      ...result,
+      principal: authContext.principal.email,
+      mapping_source: authContext.mapping_source,
+    },
+  });
+}
+
+/**
+ * POST /v1/entitlements/record
+ * CLI-compatible endpoint: Record command execution
+ *
+ * SECURITY: Usage recording is the authoritative audit trail
+ * - REQUIRES Cloud Run IAM authentication
+ * - org_id is resolved from authenticated principal (NOT from client)
+ * - principal is cryptographically attributable to GCP identity
+ * - Client-supplied org_id/user_id are IGNORED
+ *
+ * MANDATORY fields in every usage record:
+ * - org_id (resolved internally from principal)
+ * - principal (GCP identity from Cloud Run auth)
+ * - command_name
+ * - timestamp (set by server)
+ * - success / failure
+ * - cost_units (credits_used)
+ */
+async function handleRecordExecution(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // STEP 1: Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) {
+    return; // Error already sent
+  }
+
+  // STEP 2: Parse request body
+  const body = parseJsonBody(await readBody(req));
+
+  if (typeof body !== 'object' || body === null) {
+    throw invalidRequest('Request body must be an object');
+  }
+
+  const data = body as Record<string, unknown>;
+
+  // Validate required fields (org_id NOT required - comes from auth)
+  if (!data['command_name'] || typeof data['command_name'] !== 'string') {
+    throw invalidRequest('command_name is required and must be a string');
+  }
+  if (typeof data['success'] !== 'boolean') {
+    throw invalidRequest('success is required and must be a boolean');
+  }
+
+  // STEP 3: Record usage with authenticated org_id and principal
+  // Client-supplied org_id and user_id are IGNORED
+  const result = await recordCommandExecution({
+    organization_id: authContext.organization_id, // From server-side mapping
+    user_id: authContext.principal.email, // Authenticated GCP identity
+    command_name: data['command_name'] as string,
+    success: data['success'] as boolean,
+    credits_used: typeof data['credits_used'] === 'number' ? data['credits_used'] : undefined,
+    execution_time_ms: typeof data['execution_time_ms'] === 'number' ? data['execution_time_ms'] : undefined,
+    correlation_id: typeof data['correlation_id'] === 'string' ? data['correlation_id'] : undefined,
+    metadata: {
+      // Include audit metadata
+      principal: authContext.principal.email,
+      principal_subject: authContext.principal.subject,
+      mapping_source: authContext.mapping_source,
+      // Include any client-provided metadata
+      ...(typeof data['metadata'] === 'object' && data['metadata'] !== null
+        ? data['metadata'] as Record<string, unknown>
+        : {}),
+    },
+  });
+
+  sendJson(res, 201, {
+    data: {
+      ...result,
+      principal: authContext.principal.email,
+      organization_id: authContext.organization_id,
+    },
+  });
+}
+
+/**
+ * GET /v1/entitlements/commands
+ * CLI-compatible endpoint: List all entitled commands
+ */
+async function handleListEntitledCommands(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const commands = getEntitledCommands();
+  sendJson(res, 200, {
+    data: commands,
+    total: commands.length,
+  });
+}
+
+// ============================================================================
+// Usage Query Handlers (UI Backend - IAM-secured)
+// ============================================================================
+
+/**
+ * Parse date from query parameter
+ */
+function parseDateParam(value: string | null): Date | undefined {
+  if (!value) return undefined;
+  const date = new Date(value);
+  if (isNaN(date.getTime())) {
+    throw invalidRequest(`Invalid date format: ${value}`);
+  }
+  return date;
+}
+
+/**
+ * GET /usage/summary
+ * Get usage summary for authenticated organization
+ *
+ * SECURITY: Requires Cloud Run IAM authentication
+ * - org_id is resolved from authenticated principal
+ * - Only returns data for the authenticated organization
+ *
+ * Query params:
+ * - from_date: Start date (ISO format, default: 30 days ago)
+ * - to_date: End date (ISO format, default: now)
+ */
+async function handleUsageQuerySummary(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) return;
+
+  const query = parseQueryParams(req.url || '');
+  const fromDate = parseDateParam(query.get('from_date'));
+  const toDate = parseDateParam(query.get('to_date'));
+
+  const summary = await getOrgUsageSummary(
+    authContext.organization_id,
+    fromDate,
+    toDate
+  );
+
+  sendJson(res, 200, {
+    data: summary,
+    principal: authContext.principal.email,
+  });
+}
+
+/**
+ * GET /usage/by-command
+ * Get usage breakdown by command for authenticated organization
+ *
+ * SECURITY: Requires Cloud Run IAM authentication
+ * - org_id is resolved from authenticated principal
+ * - Only returns data for the authenticated organization
+ * - No cross-org access possible
+ *
+ * Query params:
+ * - from_date: Start date (ISO format, default: 30 days ago)
+ * - to_date: End date (ISO format, default: now)
+ * - limit: Max records to return (default: 50, max: 100)
+ * - offset: Pagination offset (default: 0)
+ */
+async function handleUsageQueryByCommand(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) return;
+
+  const query = parseQueryParams(req.url || '');
+
+  const result = await getUsageByCommand({
+    organization_id: authContext.organization_id,
+    from_date: parseDateParam(query.get('from_date')),
+    to_date: parseDateParam(query.get('to_date')),
+    limit: query.get('limit') ? parseInt(query.get('limit')!, 10) : undefined,
+    offset: query.get('offset') ? parseInt(query.get('offset')!, 10) : undefined,
+  });
+
+  sendJson(res, 200, {
+    data: result.data,
+    total: result.total,
+    organization_id: authContext.organization_id,
+    principal: authContext.principal.email,
+  });
+}
+
+/**
+ * GET /usage/by-user
+ * Get usage breakdown by user/principal for authenticated organization
+ *
+ * SECURITY: Requires Cloud Run IAM authentication
+ * - org_id is resolved from authenticated principal
+ * - Only returns data for the authenticated organization
+ * - User IDs are GCP principal emails (auditable)
+ *
+ * Query params:
+ * - from_date: Start date (ISO format, default: 30 days ago)
+ * - to_date: End date (ISO format, default: now)
+ * - limit: Max records to return (default: 50, max: 100)
+ * - offset: Pagination offset (default: 0)
+ */
+async function handleUsageQueryByUser(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) return;
+
+  const query = parseQueryParams(req.url || '');
+
+  const result = await getUsageByUser({
+    organization_id: authContext.organization_id,
+    from_date: parseDateParam(query.get('from_date')),
+    to_date: parseDateParam(query.get('to_date')),
+    limit: query.get('limit') ? parseInt(query.get('limit')!, 10) : undefined,
+    offset: query.get('offset') ? parseInt(query.get('offset')!, 10) : undefined,
+  });
+
+  sendJson(res, 200, {
+    data: result.data,
+    total: result.total,
+    organization_id: authContext.organization_id,
+    principal: authContext.principal.email,
+  });
+}
+
+/**
+ * GET /usage/by-day
+ * Get daily usage breakdown for authenticated organization
+ *
+ * SECURITY: Requires Cloud Run IAM authentication
+ * - org_id is resolved from authenticated principal
+ * - Only returns data for the authenticated organization
+ *
+ * Query params:
+ * - from_date: Start date (ISO format, default: 30 days ago)
+ * - to_date: End date (ISO format, default: now)
+ * - limit: Max days to return (default: 90, max: 365)
+ * - offset: Pagination offset (default: 0)
+ */
+async function handleUsageQueryByDay(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) return;
+
+  const query = parseQueryParams(req.url || '');
+
+  const result = await getUsageByDay({
+    organization_id: authContext.organization_id,
+    from_date: parseDateParam(query.get('from_date')),
+    to_date: parseDateParam(query.get('to_date')),
+    limit: query.get('limit') ? parseInt(query.get('limit')!, 10) : undefined,
+    offset: query.get('offset') ? parseInt(query.get('offset')!, 10) : undefined,
+  });
+
+  sendJson(res, 200, {
+    data: result.data,
+    total: result.total,
+    organization_id: authContext.organization_id,
+    principal: authContext.principal.email,
+  });
+}
+
+/**
+ * GET /usage/recent
+ * Get recent activity for authenticated organization (for dashboards)
+ *
+ * SECURITY: Requires Cloud Run IAM authentication
+ *
+ * Query params:
+ * - limit: Max records to return (default: 20, max: 100)
+ */
+async function handleUsageQueryRecent(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) return;
+
+  const query = parseQueryParams(req.url || '');
+  const limit = query.get('limit') ? parseInt(query.get('limit')!, 10) : 20;
+
+  const activity = await getRecentActivity(authContext.organization_id, limit);
+
+  sendJson(res, 200, {
+    data: activity,
+    organization_id: authContext.organization_id,
+    principal: authContext.principal.email,
+  });
+}
+
+/**
+ * GET /usage/top-commands
+ * Get top commands for authenticated organization (for dashboards)
+ *
+ * SECURITY: Requires Cloud Run IAM authentication
+ *
+ * Query params:
+ * - limit: Max commands to return (default: 10, max: 50)
+ * - from_date: Start date (ISO format, default: 30 days ago)
+ */
+async function handleUsageQueryTopCommands(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) return;
+
+  const query = parseQueryParams(req.url || '');
+  const limit = query.get('limit') ? parseInt(query.get('limit')!, 10) : 10;
+  const fromDate = parseDateParam(query.get('from_date'));
+
+  const commands = await getTopCommands(
+    authContext.organization_id,
+    limit,
+    fromDate
+  );
+
+  sendJson(res, 200, {
+    data: commands,
+    organization_id: authContext.organization_id,
+    principal: authContext.principal.email,
+  });
+}
+
+/**
+ * GET /usage/top-users
+ * Get top users for authenticated organization (for dashboards)
+ *
+ * SECURITY: Requires Cloud Run IAM authentication
+ *
+ * Query params:
+ * - limit: Max users to return (default: 10, max: 50)
+ * - from_date: Start date (ISO format, default: 30 days ago)
+ */
+async function handleUsageQueryTopUsers(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) return;
+
+  const query = parseQueryParams(req.url || '');
+  const limit = query.get('limit') ? parseInt(query.get('limit')!, 10) : 10;
+  const fromDate = parseDateParam(query.get('from_date'));
+
+  const users = await getTopUsers(
+    authContext.organization_id,
+    limit,
+    fromDate
+  );
+
+  sendJson(res, 200, {
+    data: users,
+    organization_id: authContext.organization_id,
+    principal: authContext.principal.email,
   });
 }
 
@@ -644,6 +1257,58 @@ export async function handleRequest(
 
     if (method === 'POST' && ROUTES.usageRecord.test(path)) {
       await handleUsageRecord(req, res);
+      return;
+    }
+
+    // CLI-compatible Entitlement API
+    if (method === 'POST' && ROUTES.canExecuteCommand.test(path)) {
+      await handleCanExecuteCommand(req, res);
+      return;
+    }
+
+    if (method === 'POST' && ROUTES.recordExecution.test(path)) {
+      await handleRecordExecution(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.entitledCommandsList.test(path)) {
+      await handleListEntitledCommands(req, res);
+      return;
+    }
+
+    // Usage Query Endpoints (UI Backend - IAM-secured)
+    if (method === 'GET' && ROUTES.usageQuerySummary.test(path)) {
+      await handleUsageQuerySummary(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.usageQueryByCommand.test(path)) {
+      await handleUsageQueryByCommand(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.usageQueryByUser.test(path)) {
+      await handleUsageQueryByUser(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.usageQueryByDay.test(path)) {
+      await handleUsageQueryByDay(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.usageQueryRecent.test(path)) {
+      await handleUsageQueryRecent(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.usageQueryTopCommands.test(path)) {
+      await handleUsageQueryTopCommands(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.usageQueryTopUsers.test(path)) {
+      await handleUsageQueryTopUsers(req, res);
       return;
     }
 
@@ -732,6 +1397,38 @@ export async function handleRequest(
       const params = parsePathParams(path, ROUTES.reversals);
       if (params) {
         await handleReversal(req, res, params);
+        return;
+      }
+    }
+
+    // Entitlements (Organization-scoped)
+    if (method === 'GET') {
+      // Check specific command first (more specific route)
+      let params = parsePathParams(path, ROUTES.entitlementCommand);
+      if (params) {
+        await handleCheckCommand(req, res, params);
+        return;
+      }
+
+      // Check commands list
+      params = parsePathParams(path, ROUTES.entitlementCommands);
+      if (params) {
+        await handleGetEntitledCommands(req, res, params);
+        return;
+      }
+
+      // Check all entitlements for org
+      params = parsePathParams(path, ROUTES.entitlements);
+      if (params) {
+        await handleGetEntitlements(req, res, params);
+        return;
+      }
+    }
+
+    if (method === 'POST') {
+      const params = parsePathParams(path, ROUTES.entitlements);
+      if (params) {
+        await handleInitEntitlements(req, res, params);
         return;
       }
     }

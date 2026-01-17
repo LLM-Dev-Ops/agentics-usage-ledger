@@ -18,6 +18,11 @@ import type {
   ConsumeRequest,
   UsageHistoryParams,
   PaginatedResponse,
+  CommandCheckRequest,
+  CommandCheckResponse,
+  CommandUsageRequest,
+  CommandUsageRecord,
+  CommandEntitlement,
 } from '../types/index.js';
 
 import {
@@ -33,6 +38,10 @@ import {
   entryNotFound,
   alreadyReversed,
   invalidAmount,
+  commandNotEntitled,
+  entitlementSuspended,
+  dailyLimitExceeded,
+  monthlyLimitExceeded,
 } from '../errors/index.js';
 
 import {
@@ -53,6 +62,18 @@ import {
   hasBeenReversed,
   getPool,
 } from '../db/index.js';
+
+import {
+  getEntitlement,
+  getEntitlementsByOrg,
+  getDailyUsageCount,
+  getMonthlyUsageCount,
+  getUsageStats,
+  recordCommandUsage,
+  getCommandUsageHistory,
+  bootstrapOrgEntitlements,
+  ENTITLED_COMMANDS,
+} from '../db/entitlements.js';
 
 // ============================================================================
 // Balance Queries (Read-only)
@@ -610,4 +631,175 @@ export async function reverseEntry(
       client
     );
   });
+}
+
+// ============================================================================
+// Entitlement Checking (Command Authorization)
+// ============================================================================
+
+/**
+ * Check if a command is allowed for an organization
+ * This is the entitlement gate - must pass before command execution
+ *
+ * Execution Order:
+ * 1. Hard execution gate (CLI) - checked externally
+ * 2. Entitlement check (this function) - checked here
+ * 3. Command execution - proceeds if allowed
+ * 4. Usage record emission - recorded after execution
+ */
+export async function isCommandAllowed(
+  req: CommandCheckRequest
+): Promise<CommandCheckResponse> {
+  const { organization_id, command_name, user_id } = req;
+
+  // Step 1: Get the entitlement for this org/command
+  const entitlement = await getEntitlement(organization_id, command_name);
+
+  // Step 2: Check if entitlement exists
+  if (!entitlement) {
+    // No entitlement record = not entitled
+    return {
+      allowed: false,
+      organization_id,
+      command_name,
+      credits_per_use: 0,
+      reason: 'Your organization is not entitled to run this command.',
+    };
+  }
+
+  // Step 3: Check entitlement status
+  if (entitlement.status === 'disabled') {
+    return {
+      allowed: false,
+      organization_id,
+      command_name,
+      credits_per_use: entitlement.credits_per_use,
+      reason: 'This command has been disabled for your organization.',
+    };
+  }
+
+  if (entitlement.status === 'suspended') {
+    return {
+      allowed: false,
+      organization_id,
+      command_name,
+      credits_per_use: entitlement.credits_per_use,
+      reason: 'Your entitlement to this command has been suspended.',
+    };
+  }
+
+  // Step 4: Get current usage stats
+  const stats = await getUsageStats(organization_id, command_name);
+
+  // Step 5: Check daily limit
+  if (entitlement.daily_limit !== null && stats.daily_count >= entitlement.daily_limit) {
+    return {
+      allowed: false,
+      organization_id,
+      command_name,
+      credits_per_use: entitlement.credits_per_use,
+      reason: 'Daily usage limit exceeded for this command.',
+      daily_usage: stats.daily_count,
+      daily_limit: entitlement.daily_limit,
+    };
+  }
+
+  // Step 6: Check monthly limit
+  if (entitlement.monthly_limit !== null && stats.monthly_count >= entitlement.monthly_limit) {
+    return {
+      allowed: false,
+      organization_id,
+      command_name,
+      credits_per_use: entitlement.credits_per_use,
+      reason: 'Monthly usage limit exceeded for this command.',
+      monthly_usage: stats.monthly_count,
+      monthly_limit: entitlement.monthly_limit,
+    };
+  }
+
+  // Step 7: All checks passed - command is allowed
+  return {
+    allowed: true,
+    organization_id,
+    command_name,
+    credits_per_use: entitlement.credits_per_use,
+    daily_usage: stats.daily_count,
+    daily_limit: entitlement.daily_limit,
+    monthly_usage: stats.monthly_count,
+    monthly_limit: entitlement.monthly_limit,
+  };
+}
+
+/**
+ * Record command usage after execution
+ * This is the usage emission step - called after successful command execution
+ *
+ * MANDATORY: On every allowed execution, emit a usage record containing:
+ * - org_id
+ * - user_id (if available)
+ * - command_name
+ * - timestamp
+ * - success / failure
+ * - cost_units (credits_used)
+ */
+export async function recordCommandExecution(
+  req: CommandUsageRequest
+): Promise<CommandUsageRecord> {
+  const {
+    organization_id,
+    user_id,
+    command_name,
+    success,
+    credits_used,
+    execution_time_ms,
+    correlation_id,
+    metadata,
+  } = req;
+
+  // Get the entitlement to determine credits_per_use if not provided
+  let creditsToCharge = credits_used;
+  if (creditsToCharge === undefined) {
+    const entitlement = await getEntitlement(organization_id, command_name);
+    creditsToCharge = entitlement?.credits_per_use || 1;
+  }
+
+  // Record the usage
+  const usageRecord = await recordCommandUsage({
+    organization_id,
+    user_id,
+    command_name,
+    credits_used: creditsToCharge,
+    success,
+    execution_time_ms,
+    correlation_id,
+    metadata,
+  });
+
+  return usageRecord;
+}
+
+/**
+ * Get all entitlements for an organization
+ */
+export async function getOrgEntitlements(
+  organizationId: string
+): Promise<CommandEntitlement[]> {
+  return getEntitlementsByOrg(organizationId);
+}
+
+/**
+ * Get the list of all commands that require entitlements
+ */
+export function getEntitledCommands(): readonly string[] {
+  return ENTITLED_COMMANDS;
+}
+
+/**
+ * Bootstrap entitlements for a new organization
+ * Creates default entitlements for all entitled commands
+ */
+export async function initializeOrgEntitlements(
+  organizationId: string
+): Promise<void> {
+  await bootstrapOrgEntitlements(organizationId);
 }

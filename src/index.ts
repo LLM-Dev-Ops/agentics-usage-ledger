@@ -15,6 +15,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
 import { initDb, closeDb } from './db/index.js';
 import { setupUsageSchema } from './db/setup.js';
+import { initEntitlementsTables } from './db/entitlements.js';
+import { initOrgMappingTables, isCloudRunEnvironment, shouldEnforceAuth } from './auth/index.js';
 import { handleRequest } from './api/handlers.js';
 
 const PORT = parseInt(process.env['PORT'] || '3000', 10);
@@ -34,6 +36,32 @@ async function start(): Promise<void> {
   } catch (error) {
     console.warn('Warning: Could not setup usage schema:', (error as Error).message);
     console.warn('Usage endpoints may not work until database is configured');
+  }
+
+  // Setup entitlements schema (create tables if needed)
+  try {
+    await initEntitlementsTables();
+  } catch (error) {
+    console.warn('Warning: Could not setup entitlements schema:', (error as Error).message);
+    console.warn('Entitlement endpoints may not work until database is configured');
+  }
+
+  // Setup org mapping schema (create tables if needed)
+  try {
+    await initOrgMappingTables();
+  } catch (error) {
+    console.warn('Warning: Could not setup org mapping schema:', (error as Error).message);
+    console.warn('Principal-to-org mapping may not work until database is configured');
+  }
+
+  // Log authentication mode
+  if (isCloudRunEnvironment()) {
+    console.log('Running in Cloud Run - IAM authentication ENFORCED');
+  } else if (shouldEnforceAuth()) {
+    console.log('Development mode - authentication ENFORCED (set SKIP_AUTH_IN_DEV=true to bypass)');
+  } else {
+    console.warn('WARNING: Development mode - authentication BYPASSED');
+    console.warn('Set SKIP_AUTH_IN_DEV=false or unset to enforce authentication');
   }
 
   // Create HTTP server
@@ -94,6 +122,10 @@ async function start(): Promise<void> {
     console.log('  GET  /v1/usage');
     console.log('  GET  /v1/usage/history');
     console.log('  POST /v1/usage/record');
+    console.log('  -- Entitlement API (CLI compatible) --');
+    console.log('  GET  /v1/entitlements/commands');
+    console.log('  POST /v1/entitlements/can-execute');
+    console.log('  POST /v1/entitlements/record');
     console.log('  -- Full Ledger API --');
     console.log('  GET  /v1/organizations/{org_id}/balance');
     console.log('  POST /v1/organizations/{org_id}/can-execute');
@@ -106,6 +138,19 @@ async function start(): Promise<void> {
     console.log('  POST /v1/organizations/{org_id}/reservations/{reservation_id}/consume');
     console.log('  POST /v1/organizations/{org_id}/reservations/{reservation_id}/cancel');
     console.log('  POST /v1/organizations/{org_id}/reversals');
+    console.log('  -- Entitlement API (per-org) --');
+    console.log('  GET  /v1/organizations/{org_id}/entitlements');
+    console.log('  POST /v1/organizations/{org_id}/entitlements');
+    console.log('  GET  /v1/organizations/{org_id}/entitlements/commands');
+    console.log('  GET  /v1/organizations/{org_id}/entitlements/commands/{command_name}');
+    console.log('  -- Usage Query API (UI Backend - IAM secured) --');
+    console.log('  GET  /usage/summary');
+    console.log('  GET  /usage/by-command');
+    console.log('  GET  /usage/by-user');
+    console.log('  GET  /usage/by-day');
+    console.log('  GET  /usage/recent');
+    console.log('  GET  /usage/top-commands');
+    console.log('  GET  /usage/top-users');
   });
 }
 
@@ -117,6 +162,8 @@ start().catch((error) => {
 
 // Export for testing
 export { initDb, closeDb } from './db/index.js';
+export { initEntitlementsTables, ENTITLED_COMMANDS } from './db/entitlements.js';
 export * from './ledger/index.js';
 export * from './types/index.js';
 export * from './errors/index.js';
+export * from './auth/index.js';
