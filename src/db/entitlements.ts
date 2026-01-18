@@ -1,6 +1,11 @@
 /**
  * Database access layer for entitlements
  * Manages command entitlements and usage tracking
+ *
+ * Includes Stripe metered usage emission:
+ * - On every finalized usage record, emits to Stripe
+ * - Stripe failures do not block command execution
+ * - Uses usage_id as idempotency key
  */
 
 import type { PoolClient } from 'pg';
@@ -13,6 +18,12 @@ import type {
 import { getPool } from './index.js';
 import { internalError } from '../errors/index.js';
 import { randomUUID } from 'crypto';
+import {
+  emitMeterEventAsync,
+  getWeightedExecutionUnits,
+  isStripeConfigured,
+} from '../stripe/index.js';
+import { resolveStripeCustomer } from './org-stripe.js';
 
 // ============================================================================
 // Schema Initialization
@@ -199,6 +210,10 @@ export async function updateEntitlementStatus(
 
 /**
  * Record a command usage event
+ *
+ * After recording to local ledger (source of truth), emits a meter
+ * event to Stripe for usage tracking. Stripe failures are logged
+ * but do not block the operation.
  */
 export async function recordCommandUsage(
   data: {
@@ -238,7 +253,55 @@ export async function recordCommandUsage(
   if (!inserted) {
     throw internalError();
   }
+
+  // Emit Stripe meter event asynchronously (fire and forget)
+  // This MUST NOT block command execution or fail the operation
+  if (isStripeConfigured()) {
+    emitStripeUsageEvent(inserted).catch((error) => {
+      console.error('[Stripe] Failed to emit usage event:', error);
+    });
+  }
+
   return inserted;
+}
+
+/**
+ * Emit Stripe meter event for a usage record
+ * Called asynchronously after recording usage to local ledger
+ *
+ * Failures are logged but do not affect the usage record.
+ */
+async function emitStripeUsageEvent(
+  usageRecord: CommandUsageRecord
+): Promise<void> {
+  // Resolve Stripe customer (lazy creation if needed)
+  const stripeCustomerId = await resolveStripeCustomer(
+    usageRecord.organization_id
+  );
+
+  if (!stripeCustomerId) {
+    // No Stripe customer - this is fine, just skip
+    console.log(
+      `[Stripe] No customer for org ${usageRecord.organization_id}, skipping meter event`
+    );
+    return;
+  }
+
+  // Calculate weighted execution units
+  const executionUnits = getWeightedExecutionUnits(
+    usageRecord.command_name,
+    usageRecord.credits_used
+  );
+
+  // Emit meter event (fire and forget)
+  emitMeterEventAsync({
+    stripeCustomerId,
+    usageId: usageRecord.usage_id,
+    organizationId: usageRecord.organization_id,
+    executionUnits,
+    timestamp: usageRecord.created_at,
+    commandName: usageRecord.command_name,
+  });
 }
 
 /**

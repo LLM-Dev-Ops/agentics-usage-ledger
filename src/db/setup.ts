@@ -4,6 +4,7 @@
  */
 
 import { getPool } from './index.js';
+import { addStripeCustomerColumn } from './org-stripe.js';
 
 /**
  * Setup database schema for usage tracking
@@ -63,6 +64,9 @@ export async function setupUsageSchema(): Promise<void> {
     VALUES ('default', 10000, 0)
     ON CONFLICT (org_id) DO NOTHING
   `);
+
+  // Add Stripe customer column for metered usage tracking
+  await addStripeCustomerColumn();
 
   console.log('Usage schema setup complete');
 }

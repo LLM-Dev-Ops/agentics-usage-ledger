@@ -263,3 +263,43 @@ export interface CommandUsageStats {
   monthly_count: number;
   total_credits_used: number;
 }
+
+// ============================================================================
+// Stripe Metered Usage Types
+// ============================================================================
+
+/**
+ * Stripe meter event emission parameters
+ */
+export interface StripeMeterEventParams {
+  /** Stripe customer ID (required) */
+  stripeCustomerId: string;
+  /** Usage ID from command_usage (idempotency key) */
+  usageId: string;
+  /** Organization ID for logging */
+  organizationId: string;
+  /** Execution units to record */
+  executionUnits: number;
+  /** Event timestamp */
+  timestamp: Date;
+  /** Optional command reference */
+  commandName?: string;
+}
+
+/**
+ * Result of Stripe meter event emission
+ */
+export interface StripeMeterEventResult {
+  success: boolean;
+  eventId?: string;
+  error?: string;
+}
+
+/**
+ * Stripe health check response
+ */
+export interface StripeHealthStatus {
+  configured: boolean;
+  connected: boolean;
+  error?: string;
+}
