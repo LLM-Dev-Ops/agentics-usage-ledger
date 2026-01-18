@@ -19,66 +19,63 @@ import { getPool } from './index.js';
 
 /**
  * Usage summary for an organization
+ * Matches the required response format for Usage UI graphs
  */
 export interface UsageSummary {
-  organization_id: string;
-  period: {
+  /** Total number of command executions in the time window */
+  total_executions: number;
+  /** Total cost (credits consumed) in the time window */
+  total_cost: number;
+  /** Total number of failed executions in the time window */
+  total_failures: number;
+  /** Time window for the aggregation */
+  time_window: {
     start: string;
     end: string;
   };
-  totals: {
-    total_executions: number;
-    successful_executions: number;
-    failed_executions: number;
-    total_credits_used: number;
-    unique_commands: number;
-    unique_users: number;
-  };
-  daily_average: {
-    executions: number;
-    credits: number;
-  };
-  success_rate: number;
 }
 
 /**
  * Usage breakdown by command
+ * Matches the required response format for Usage UI graphs
  */
 export interface UsageByCommand {
+  /** Command name */
   command_name: string;
+  /** Number of executions of this command */
   execution_count: number;
-  success_count: number;
+  /** Total cost (credits consumed) for this command */
+  total_cost: number;
+  /** Number of failed executions of this command */
   failure_count: number;
-  total_credits: number;
-  unique_users: number;
-  avg_execution_time_ms: number | null;
-  last_used_at: string;
 }
 
 /**
  * Usage breakdown by user/principal
+ * Matches the required response format for Usage UI graphs
  */
 export interface UsageByUser {
-  user_id: string;
+  /** Principal (GCP identity email) */
+  principal: string;
+  /** Number of executions by this principal */
   execution_count: number;
-  success_count: number;
-  failure_count: number;
-  total_credits: number;
-  unique_commands: number;
-  last_active_at: string;
+  /** Total cost (credits consumed) by this principal */
+  total_cost: number;
 }
 
 /**
  * Usage breakdown by day
+ * Matches the required response format for Usage UI graphs (time series)
  */
 export interface UsageByDay {
+  /** Date in ISO format (YYYY-MM-DD) */
   date: string;
+  /** Number of executions on this day */
   execution_count: number;
-  success_count: number;
+  /** Total cost (credits consumed) on this day */
+  total_cost: number;
+  /** Number of failed executions on this day */
   failure_count: number;
-  total_credits: number;
-  unique_commands: number;
-  unique_users: number;
 }
 
 /**
@@ -99,6 +96,9 @@ export interface UsageQueryParams {
 /**
  * Get usage summary for an organization
  *
+ * Returns aggregated usage data for the specified time window.
+ * All aggregation is done in SQL for efficiency.
+ *
  * @param organizationId - Organization ID from authenticated context
  * @param fromDate - Start date (default: 30 days ago)
  * @param toDate - End date (default: now)
@@ -115,21 +115,13 @@ export async function getUsageSummary(
 
   const result = await db.query<{
     total_executions: string;
-    successful_executions: string;
-    failed_executions: string;
-    total_credits_used: string;
-    unique_commands: string;
-    unique_users: string;
-    days_in_period: string;
+    total_failures: string;
+    total_cost: string;
   }>(
     `SELECT
       COUNT(*)::text as total_executions,
-      COUNT(*) FILTER (WHERE success = true)::text as successful_executions,
-      COUNT(*) FILTER (WHERE success = false)::text as failed_executions,
-      COALESCE(SUM(credits_used), 0)::text as total_credits_used,
-      COUNT(DISTINCT command_name)::text as unique_commands,
-      COUNT(DISTINCT COALESCE(user_id, 'anonymous'))::text as unique_users,
-      GREATEST(1, EXTRACT(DAY FROM ($3::timestamptz - $2::timestamptz)))::text as days_in_period
+      COUNT(*) FILTER (WHERE success = false)::text as total_failures,
+      COALESCE(SUM(credits_used), 0)::text as total_cost
     FROM command_usage
     WHERE organization_id = $1
       AND created_at >= $2
@@ -138,37 +130,23 @@ export async function getUsageSummary(
   );
 
   const row = result.rows[0];
-  const totalExecutions = parseInt(row?.total_executions || '0', 10);
-  const successfulExecutions = parseInt(row?.successful_executions || '0', 10);
-  const daysInPeriod = parseInt(row?.days_in_period || '1', 10);
-  const totalCredits = parseInt(row?.total_credits_used || '0', 10);
 
   return {
-    organization_id: organizationId,
-    period: {
+    total_executions: parseInt(row?.total_executions || '0', 10),
+    total_cost: parseInt(row?.total_cost || '0', 10),
+    total_failures: parseInt(row?.total_failures || '0', 10),
+    time_window: {
       start: startDate.toISOString(),
       end: endDate.toISOString(),
     },
-    totals: {
-      total_executions: totalExecutions,
-      successful_executions: successfulExecutions,
-      failed_executions: parseInt(row?.failed_executions || '0', 10),
-      total_credits_used: totalCredits,
-      unique_commands: parseInt(row?.unique_commands || '0', 10),
-      unique_users: parseInt(row?.unique_users || '0', 10),
-    },
-    daily_average: {
-      executions: Math.round((totalExecutions / daysInPeriod) * 100) / 100,
-      credits: Math.round((totalCredits / daysInPeriod) * 100) / 100,
-    },
-    success_rate: totalExecutions > 0
-      ? Math.round((successfulExecutions / totalExecutions) * 10000) / 100
-      : 100,
   };
 }
 
 /**
  * Get usage breakdown by command
+ *
+ * Returns grouped metrics per command for the specified time window.
+ * All aggregation is done in SQL for efficiency.
  *
  * @param organizationId - Organization ID from authenticated context
  */
@@ -182,7 +160,7 @@ export async function getUsageByCommand(
   const limit = Math.min(params.limit || 50, 100);
   const offset = params.offset || 0;
 
-  // Get total count
+  // Get total count of unique commands
   const countResult = await db.query<{ count: string }>(
     `SELECT COUNT(DISTINCT command_name)::text as count
      FROM command_usage
@@ -193,26 +171,18 @@ export async function getUsageByCommand(
   );
   const total = parseInt(countResult.rows[0]?.count || '0', 10);
 
-  // Get aggregated data
+  // Get aggregated data per command
   const result = await db.query<{
     command_name: string;
     execution_count: string;
-    success_count: string;
     failure_count: string;
-    total_credits: string;
-    unique_users: string;
-    avg_execution_time_ms: string | null;
-    last_used_at: Date;
+    total_cost: string;
   }>(
     `SELECT
       command_name,
       COUNT(*)::text as execution_count,
-      COUNT(*) FILTER (WHERE success = true)::text as success_count,
       COUNT(*) FILTER (WHERE success = false)::text as failure_count,
-      COALESCE(SUM(credits_used), 0)::text as total_credits,
-      COUNT(DISTINCT COALESCE(user_id, 'anonymous'))::text as unique_users,
-      AVG(execution_time_ms)::text as avg_execution_time_ms,
-      MAX(created_at) as last_used_at
+      COALESCE(SUM(credits_used), 0)::text as total_cost
     FROM command_usage
     WHERE organization_id = $1
       AND created_at >= $2
@@ -226,14 +196,8 @@ export async function getUsageByCommand(
   const data: UsageByCommand[] = result.rows.map(row => ({
     command_name: row.command_name,
     execution_count: parseInt(row.execution_count, 10),
-    success_count: parseInt(row.success_count, 10),
+    total_cost: parseInt(row.total_cost, 10),
     failure_count: parseInt(row.failure_count, 10),
-    total_credits: parseInt(row.total_credits, 10),
-    unique_users: parseInt(row.unique_users, 10),
-    avg_execution_time_ms: row.avg_execution_time_ms
-      ? Math.round(parseFloat(row.avg_execution_time_ms))
-      : null,
-    last_used_at: row.last_used_at.toISOString(),
   }));
 
   return { data, total };
@@ -241,6 +205,9 @@ export async function getUsageByCommand(
 
 /**
  * Get usage breakdown by user/principal
+ *
+ * Returns aggregated metrics per principal (GCP identity).
+ * All aggregation is done in SQL for efficiency.
  *
  * @param organizationId - Organization ID from authenticated context
  */
@@ -254,7 +221,7 @@ export async function getUsageByUser(
   const limit = Math.min(params.limit || 50, 100);
   const offset = params.offset || 0;
 
-  // Get total count
+  // Get total count of unique principals
   const countResult = await db.query<{ count: string }>(
     `SELECT COUNT(DISTINCT COALESCE(user_id, 'anonymous'))::text as count
      FROM command_usage
@@ -265,24 +232,16 @@ export async function getUsageByUser(
   );
   const total = parseInt(countResult.rows[0]?.count || '0', 10);
 
-  // Get aggregated data
+  // Get aggregated data per principal
   const result = await db.query<{
-    user_id: string;
+    principal: string;
     execution_count: string;
-    success_count: string;
-    failure_count: string;
-    total_credits: string;
-    unique_commands: string;
-    last_active_at: Date;
+    total_cost: string;
   }>(
     `SELECT
-      COALESCE(user_id, 'anonymous') as user_id,
+      COALESCE(user_id, 'anonymous') as principal,
       COUNT(*)::text as execution_count,
-      COUNT(*) FILTER (WHERE success = true)::text as success_count,
-      COUNT(*) FILTER (WHERE success = false)::text as failure_count,
-      COALESCE(SUM(credits_used), 0)::text as total_credits,
-      COUNT(DISTINCT command_name)::text as unique_commands,
-      MAX(created_at) as last_active_at
+      COALESCE(SUM(credits_used), 0)::text as total_cost
     FROM command_usage
     WHERE organization_id = $1
       AND created_at >= $2
@@ -294,13 +253,9 @@ export async function getUsageByUser(
   );
 
   const data: UsageByUser[] = result.rows.map(row => ({
-    user_id: row.user_id,
+    principal: row.principal,
     execution_count: parseInt(row.execution_count, 10),
-    success_count: parseInt(row.success_count, 10),
-    failure_count: parseInt(row.failure_count, 10),
-    total_credits: parseInt(row.total_credits, 10),
-    unique_commands: parseInt(row.unique_commands, 10),
-    last_active_at: row.last_active_at.toISOString(),
+    total_cost: parseInt(row.total_cost, 10),
   }));
 
   return { data, total };
@@ -308,6 +263,10 @@ export async function getUsageByUser(
 
 /**
  * Get usage breakdown by day
+ *
+ * Returns time series data for the specified time window.
+ * All aggregation is done in SQL for efficiency.
+ * Order is descending (most recent first) for UI graphs.
  *
  * @param organizationId - Organization ID from authenticated context
  */
@@ -336,20 +295,14 @@ export async function getUsageByDay(
   const result = await db.query<{
     date: Date;
     execution_count: string;
-    success_count: string;
     failure_count: string;
-    total_credits: string;
-    unique_commands: string;
-    unique_users: string;
+    total_cost: string;
   }>(
     `SELECT
       DATE(created_at) as date,
       COUNT(*)::text as execution_count,
-      COUNT(*) FILTER (WHERE success = true)::text as success_count,
       COUNT(*) FILTER (WHERE success = false)::text as failure_count,
-      COALESCE(SUM(credits_used), 0)::text as total_credits,
-      COUNT(DISTINCT command_name)::text as unique_commands,
-      COUNT(DISTINCT COALESCE(user_id, 'anonymous'))::text as unique_users
+      COALESCE(SUM(credits_used), 0)::text as total_cost
     FROM command_usage
     WHERE organization_id = $1
       AND created_at >= $2
@@ -363,11 +316,8 @@ export async function getUsageByDay(
   const data: UsageByDay[] = result.rows.map(row => ({
     date: row.date.toISOString().split('T')[0]!,
     execution_count: parseInt(row.execution_count, 10),
-    success_count: parseInt(row.success_count, 10),
+    total_cost: parseInt(row.total_cost, 10),
     failure_count: parseInt(row.failure_count, 10),
-    total_credits: parseInt(row.total_credits, 10),
-    unique_commands: parseInt(row.unique_commands, 10),
-    unique_users: parseInt(row.unique_users, 10),
   }));
 
   return { data, total };

@@ -965,24 +965,32 @@ function parseDateParam(value: string | null): Date | undefined {
  * Get usage summary for authenticated organization
  *
  * SECURITY: Requires Cloud Run IAM authentication
- * - org_id is resolved from authenticated principal
+ * - org_id is resolved from authenticated principal (NEVER from client)
  * - Only returns data for the authenticated organization
+ * - Unauthenticated requests are automatically rejected via IAM
  *
  * Query params:
- * - from_date: Start date (ISO format, default: 30 days ago)
- * - to_date: End date (ISO format, default: now)
+ * - start_date: Start date (ISO format, default: 30 days ago)
+ * - end_date: End date (ISO format, default: now)
+ *
+ * Returns:
+ * - total_executions: Total number of command executions
+ * - total_cost: Total credits consumed
+ * - total_failures: Total failed executions
+ * - time_window: { start, end } ISO timestamps
  */
 async function handleUsageQuerySummary(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
-  // Require authentication
+  // Require authentication - org_id resolved server-side
   const authContext = await requireAuth(req, res);
   if (!authContext) return;
 
   const query = parseQueryParams(req.url || '');
-  const fromDate = parseDateParam(query.get('from_date'));
-  const toDate = parseDateParam(query.get('to_date'));
+  // Support both start_date/end_date and from_date/to_date for flexibility
+  const fromDate = parseDateParam(query.get('start_date') || query.get('from_date'));
+  const toDate = parseDateParam(query.get('end_date') || query.get('to_date'));
 
   const summary = await getOrgUsageSummary(
     authContext.organization_id,
@@ -990,10 +998,8 @@ async function handleUsageQuerySummary(
     toDate
   );
 
-  sendJson(res, 200, {
-    data: summary,
-    principal: authContext.principal.email,
-  });
+  // Return exact spec format - no extra fields
+  sendJson(res, 200, summary);
 }
 
 /**
@@ -1001,21 +1007,28 @@ async function handleUsageQuerySummary(
  * Get usage breakdown by command for authenticated organization
  *
  * SECURITY: Requires Cloud Run IAM authentication
- * - org_id is resolved from authenticated principal
+ * - org_id is resolved from authenticated principal (NEVER from client)
  * - Only returns data for the authenticated organization
  * - No cross-org access possible
+ * - Unauthenticated requests are automatically rejected via IAM
  *
  * Query params:
- * - from_date: Start date (ISO format, default: 30 days ago)
- * - to_date: End date (ISO format, default: now)
+ * - start_date: Start date (ISO format, default: 30 days ago)
+ * - end_date: End date (ISO format, default: now)
  * - limit: Max records to return (default: 50, max: 100)
  * - offset: Pagination offset (default: 0)
+ *
+ * Returns array of:
+ * - command_name: Name of the command
+ * - execution_count: Number of executions
+ * - total_cost: Total credits consumed
+ * - failure_count: Number of failed executions
  */
 async function handleUsageQueryByCommand(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
-  // Require authentication
+  // Require authentication - org_id resolved server-side
   const authContext = await requireAuth(req, res);
   if (!authContext) return;
 
@@ -1023,18 +1036,14 @@ async function handleUsageQueryByCommand(
 
   const result = await getUsageByCommand({
     organization_id: authContext.organization_id,
-    from_date: parseDateParam(query.get('from_date')),
-    to_date: parseDateParam(query.get('to_date')),
+    from_date: parseDateParam(query.get('start_date') || query.get('from_date')),
+    to_date: parseDateParam(query.get('end_date') || query.get('to_date')),
     limit: query.get('limit') ? parseInt(query.get('limit')!, 10) : undefined,
     offset: query.get('offset') ? parseInt(query.get('offset')!, 10) : undefined,
   });
 
-  sendJson(res, 200, {
-    data: result.data,
-    total: result.total,
-    organization_id: authContext.organization_id,
-    principal: authContext.principal.email,
-  });
+  // Return array directly for chart compatibility
+  sendJson(res, 200, result.data);
 }
 
 /**
@@ -1042,21 +1051,27 @@ async function handleUsageQueryByCommand(
  * Get usage breakdown by user/principal for authenticated organization
  *
  * SECURITY: Requires Cloud Run IAM authentication
- * - org_id is resolved from authenticated principal
+ * - org_id is resolved from authenticated principal (NEVER from client)
  * - Only returns data for the authenticated organization
- * - User IDs are GCP principal emails (auditable)
+ * - Principal IDs are GCP identity emails (auditable)
+ * - Unauthenticated requests are automatically rejected via IAM
  *
  * Query params:
- * - from_date: Start date (ISO format, default: 30 days ago)
- * - to_date: End date (ISO format, default: now)
+ * - start_date: Start date (ISO format, default: 30 days ago)
+ * - end_date: End date (ISO format, default: now)
  * - limit: Max records to return (default: 50, max: 100)
  * - offset: Pagination offset (default: 0)
+ *
+ * Returns array of:
+ * - principal: GCP identity email
+ * - execution_count: Number of executions
+ * - total_cost: Total credits consumed
  */
 async function handleUsageQueryByUser(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
-  // Require authentication
+  // Require authentication - org_id resolved server-side
   const authContext = await requireAuth(req, res);
   if (!authContext) return;
 
@@ -1064,39 +1079,42 @@ async function handleUsageQueryByUser(
 
   const result = await getUsageByUser({
     organization_id: authContext.organization_id,
-    from_date: parseDateParam(query.get('from_date')),
-    to_date: parseDateParam(query.get('to_date')),
+    from_date: parseDateParam(query.get('start_date') || query.get('from_date')),
+    to_date: parseDateParam(query.get('end_date') || query.get('to_date')),
     limit: query.get('limit') ? parseInt(query.get('limit')!, 10) : undefined,
     offset: query.get('offset') ? parseInt(query.get('offset')!, 10) : undefined,
   });
 
-  sendJson(res, 200, {
-    data: result.data,
-    total: result.total,
-    organization_id: authContext.organization_id,
-    principal: authContext.principal.email,
-  });
+  // Return array directly for chart compatibility
+  sendJson(res, 200, result.data);
 }
 
 /**
  * GET /usage/by-day
- * Get daily usage breakdown for authenticated organization
+ * Get daily usage breakdown for authenticated organization (time series)
  *
  * SECURITY: Requires Cloud Run IAM authentication
- * - org_id is resolved from authenticated principal
+ * - org_id is resolved from authenticated principal (NEVER from client)
  * - Only returns data for the authenticated organization
+ * - Unauthenticated requests are automatically rejected via IAM
  *
  * Query params:
- * - from_date: Start date (ISO format, default: 30 days ago)
- * - to_date: End date (ISO format, default: now)
+ * - start_date: Start date (ISO format, default: 30 days ago)
+ * - end_date: End date (ISO format, default: now)
  * - limit: Max days to return (default: 90, max: 365)
  * - offset: Pagination offset (default: 0)
+ *
+ * Returns array of:
+ * - date: Date in YYYY-MM-DD format
+ * - execution_count: Number of executions on this day
+ * - total_cost: Total credits consumed on this day
+ * - failure_count: Number of failed executions on this day
  */
 async function handleUsageQueryByDay(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
-  // Require authentication
+  // Require authentication - org_id resolved server-side
   const authContext = await requireAuth(req, res);
   if (!authContext) return;
 
@@ -1104,18 +1122,14 @@ async function handleUsageQueryByDay(
 
   const result = await getUsageByDay({
     organization_id: authContext.organization_id,
-    from_date: parseDateParam(query.get('from_date')),
-    to_date: parseDateParam(query.get('to_date')),
+    from_date: parseDateParam(query.get('start_date') || query.get('from_date')),
+    to_date: parseDateParam(query.get('end_date') || query.get('to_date')),
     limit: query.get('limit') ? parseInt(query.get('limit')!, 10) : undefined,
     offset: query.get('offset') ? parseInt(query.get('offset')!, 10) : undefined,
   });
 
-  sendJson(res, 200, {
-    data: result.data,
-    total: result.total,
-    organization_id: authContext.organization_id,
-    principal: authContext.principal.email,
-  });
+  // Return array directly for chart compatibility
+  sendJson(res, 200, result.data);
 }
 
 /**
