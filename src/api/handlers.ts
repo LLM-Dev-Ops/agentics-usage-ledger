@@ -14,6 +14,7 @@
  * - NO trusting client-supplied org_id or user_id for writes
  */
 
+import crypto from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'http';
 import type { EntryType } from '../types/index.js';
 import {
@@ -69,6 +70,7 @@ import {
   getUsageSummary,
   getUsageHistory as getUsageHistorySimple,
   recordUsage,
+  getOrCreateAccount,
 } from '../db/usage.js';
 import {
   getUsageSummary as getOrgUsageSummary,
@@ -231,6 +233,12 @@ const ROUTES = {
   // Lifecycle Event Endpoints (event binding)
   executionCompleted: /^\/v1\/lifecycle\/execution-completed$/,
   deploymentCompleted: /^\/v1\/lifecycle\/deployment-completed$/,
+
+  // Public API endpoints (/api/v1/*)
+  apiBalance: /^\/api\/v1\/balance$/,
+  apiUsageHistory: /^\/api\/v1\/usage\/history$/,
+  apiUsageLimits: /^\/api\/v1\/usage\/limits$/,
+  apiUsageRecord: /^\/api\/v1\/usage\/record$/,
 
   // Usage Query Endpoints (UI Backend - IAM-secured)
   usageQuerySummary: /^\/usage\/summary$/,
@@ -1163,6 +1171,157 @@ async function handleDeploymentCompletedEvent(
 }
 
 // ============================================================================
+// Public API Handlers (/api/v1/*)
+// ============================================================================
+
+/**
+ * Build execution_metadata block for API responses
+ */
+function buildExecutionMetadata(): {
+  trace_id: string;
+  timestamp: string;
+  service: string;
+} {
+  return {
+    trace_id: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+    service: 'agentics-usage-ledger',
+  };
+}
+
+/**
+ * GET /api/v1/balance
+ * Current usage balance with execution metadata
+ */
+async function handleApiBalance(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const query = parseQueryParams(req.url || '');
+  const orgId = query.get('org_id') || 'default';
+
+  const account = await getOrCreateAccount(orgId);
+
+  // Compute billing period (current calendar month)
+  const now = new Date();
+  const periodStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const periodEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+
+  sendJson(res, 200, {
+    balance: {
+      credits_remaining: account.credits_remaining,
+      credits_used: account.credits_used,
+      plan: 'enterprise',
+      billing_period_start: periodStart.toISOString(),
+      billing_period_end: periodEnd.toISOString(),
+    },
+    execution_metadata: buildExecutionMetadata(),
+  });
+}
+
+/**
+ * GET /api/v1/usage/history?limit=N&offset=N
+ * Usage history with execution metadata
+ */
+async function handleApiUsageHistory(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const query = parseQueryParams(req.url || '');
+  const orgId = query.get('org_id') || 'default';
+
+  const limit = query.get('limit')
+    ? parseInt(query.get('limit')!, 10)
+    : 50;
+  const offset = query.get('offset')
+    ? parseInt(query.get('offset')!, 10)
+    : 0;
+
+  if (isNaN(limit) || limit < 1 || limit > 100) {
+    throw invalidRequest('limit must be between 1 and 100');
+  }
+  if (isNaN(offset) || offset < 0) {
+    throw invalidRequest('offset must be a non-negative integer');
+  }
+
+  const result = await getUsageHistorySimple(orgId, limit, offset);
+
+  sendJson(res, 200, {
+    history: result.history,
+    total: result.pagination.total,
+    execution_metadata: buildExecutionMetadata(),
+  });
+}
+
+/**
+ * GET /api/v1/usage/limits
+ * Current plan limits and today's usage
+ */
+async function handleApiUsageLimits(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const query = parseQueryParams(req.url || '');
+  const orgId = query.get('org_id') || 'default';
+
+  const summary = await getUsageSummary(orgId);
+
+  sendJson(res, 200, {
+    limits: {
+      simulations_per_day: 100,
+      plans_per_day: 50,
+      deployments_per_day: 10,
+      api_calls_per_minute: 60,
+    },
+    current_usage: {
+      simulations_today: summary.daily_usage,
+      plans_today: 0,
+      deployments_today: 0,
+    },
+    execution_metadata: buildExecutionMetadata(),
+  });
+}
+
+/**
+ * POST /api/v1/usage/record
+ * Record a usage event (called by other services)
+ */
+async function handleApiUsageRecord(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = parseJsonBody(await readBody(req));
+
+  if (typeof body !== 'object' || body === null) {
+    throw invalidRequest('Request body must be an object');
+  }
+
+  const data = body as Record<string, unknown>;
+
+  if (!data['action'] || typeof data['action'] !== 'string') {
+    throw invalidRequest('action is required and must be a string');
+  }
+  if (typeof data['credits_used'] !== 'number' || data['credits_used'] < 0) {
+    throw invalidRequest('credits_used is required and must be a non-negative number');
+  }
+
+  const orgId = typeof data['org_id'] === 'string' ? data['org_id'] : 'default';
+
+  await recordUsage({
+    org_id: orgId,
+    action: data['action'] as string,
+    credits_used: data['credits_used'] as number,
+    command: typeof data['command'] === 'string' ? data['command'] : undefined,
+    correlation_id: typeof data['correlation_id'] === 'string' ? data['correlation_id'] : undefined,
+  });
+
+  sendJson(res, 201, {
+    recorded: true,
+    execution_metadata: buildExecutionMetadata(),
+  });
+}
+
+// ============================================================================
 // Usage Query Handlers (UI Backend - IAM-secured)
 // ============================================================================
 
@@ -1468,6 +1627,27 @@ export async function handleRequest(
     // Health check
     if (method === 'GET' && ROUTES.health.test(path)) {
       await handleHealth(req, res);
+      return;
+    }
+
+    // Public API endpoints (/api/v1/*)
+    if (method === 'GET' && ROUTES.apiBalance.test(path)) {
+      await handleApiBalance(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.apiUsageHistory.test(path)) {
+      await handleApiUsageHistory(req, res);
+      return;
+    }
+
+    if (method === 'GET' && ROUTES.apiUsageLimits.test(path)) {
+      await handleApiUsageLimits(req, res);
+      return;
+    }
+
+    if (method === 'POST' && ROUTES.apiUsageRecord.test(path)) {
+      await handleApiUsageRecord(req, res);
       return;
     }
 
