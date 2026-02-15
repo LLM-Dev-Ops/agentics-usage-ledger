@@ -143,6 +143,9 @@ async function start(): Promise<void> {
     console.log('  POST /v1/organizations/{org_id}/entitlements');
     console.log('  GET  /v1/organizations/{org_id}/entitlements/commands');
     console.log('  GET  /v1/organizations/{org_id}/entitlements/commands/{command_name}');
+    console.log('  -- Lifecycle Event API (event binding) --');
+    console.log('  POST /v1/lifecycle/execution-completed');
+    console.log('  POST /v1/lifecycle/deployment-completed');
     console.log('  -- Usage Query API (UI Backend - IAM secured) --');
     console.log('  GET  /usage/summary');
     console.log('  GET  /usage/by-command');
@@ -167,3 +170,4 @@ export * from './ledger/index.js';
 export * from './types/index.js';
 export * from './errors/index.js';
 export * from './auth/index.js';
+export * from './lifecycle/index.js';

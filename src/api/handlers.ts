@@ -61,6 +61,10 @@ import {
   initializeOrgEntitlements,
 } from '../ledger/index.js';
 import {
+  handleExecutionCompleted,
+  handleDeploymentCompleted,
+} from '../lifecycle/index.js';
+import {
   getBalance as getUsageBalance,
   getUsageSummary,
   getUsageHistory as getUsageHistorySimple,
@@ -223,6 +227,10 @@ const ROUTES = {
   canExecuteCommand: /^\/v1\/entitlements\/can-execute$/,
   recordExecution: /^\/v1\/entitlements\/record$/,
   entitledCommandsList: /^\/v1\/entitlements\/commands$/,
+
+  // Lifecycle Event Endpoints (event binding)
+  executionCompleted: /^\/v1\/lifecycle\/execution-completed$/,
+  deploymentCompleted: /^\/v1\/lifecycle\/deployment-completed$/,
 
   // Usage Query Endpoints (UI Backend - IAM-secured)
   usageQuerySummary: /^\/usage\/summary$/,
@@ -945,6 +953,216 @@ async function handleListEntitledCommands(
 }
 
 // ============================================================================
+// Lifecycle Event Handlers
+// ============================================================================
+
+/**
+ * POST /v1/lifecycle/execution-completed
+ * Lifecycle binding: Record completed execution with token usage,
+ * cost attribution, and billing ledger update.
+ *
+ * SECURITY: Requires Cloud Run IAM authentication
+ * - org_id is resolved from authenticated principal (NEVER from client)
+ * - Token usage and cost are recorded atomically
+ *
+ * Required body fields:
+ * - command_name: string
+ * - success: boolean
+ * - token_usage: { input_tokens, output_tokens, total_tokens, model? }
+ *
+ * Optional body fields:
+ * - credits_used: number (if omitted, computed from token_usage)
+ * - execution_time_ms: number
+ * - service: string
+ * - run_id: string
+ * - correlation_id: string
+ * - idempotency_key: string
+ * - metadata: object
+ */
+async function handleExecutionCompletedEvent(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) return;
+
+  const body = parseJsonBody(await readBody(req));
+  if (typeof body !== 'object' || body === null) {
+    throw invalidRequest('Request body must be an object');
+  }
+
+  const data = body as Record<string, unknown>;
+
+  // Validate required fields
+  if (!data['command_name'] || typeof data['command_name'] !== 'string') {
+    throw invalidRequest('command_name is required and must be a string');
+  }
+  if (typeof data['success'] !== 'boolean') {
+    throw invalidRequest('success is required and must be a boolean');
+  }
+  if (!data['token_usage'] || typeof data['token_usage'] !== 'object') {
+    throw invalidRequest('token_usage is required and must be an object');
+  }
+
+  const tokenUsage = data['token_usage'] as Record<string, unknown>;
+  if (typeof tokenUsage['input_tokens'] !== 'number' || tokenUsage['input_tokens'] < 0) {
+    throw invalidRequest('token_usage.input_tokens is required and must be a non-negative number');
+  }
+  if (typeof tokenUsage['output_tokens'] !== 'number' || tokenUsage['output_tokens'] < 0) {
+    throw invalidRequest('token_usage.output_tokens is required and must be a non-negative number');
+  }
+
+  const totalTokens = typeof tokenUsage['total_tokens'] === 'number'
+    ? tokenUsage['total_tokens']
+    : (tokenUsage['input_tokens'] as number) + (tokenUsage['output_tokens'] as number);
+
+  const result = await handleExecutionCompleted({
+    organization_id: authContext.organization_id,
+    user_id: authContext.principal.email,
+    command_name: data['command_name'] as string,
+    success: data['success'] as boolean,
+    token_usage: {
+      input_tokens: tokenUsage['input_tokens'] as number,
+      output_tokens: tokenUsage['output_tokens'] as number,
+      total_tokens: totalTokens,
+      model: typeof tokenUsage['model'] === 'string' ? tokenUsage['model'] : undefined,
+    },
+    credits_used: typeof data['credits_used'] === 'number' ? data['credits_used'] : undefined,
+    execution_time_ms: typeof data['execution_time_ms'] === 'number' ? data['execution_time_ms'] : undefined,
+    service: typeof data['service'] === 'string' ? data['service'] : undefined,
+    run_id: typeof data['run_id'] === 'string' ? data['run_id'] : undefined,
+    correlation_id: typeof data['correlation_id'] === 'string' ? data['correlation_id'] : undefined,
+    idempotency_key: typeof data['idempotency_key'] === 'string' ? data['idempotency_key'] : undefined,
+    metadata: {
+      principal: authContext.principal.email,
+      principal_subject: authContext.principal.subject,
+      mapping_source: authContext.mapping_source,
+      ...(typeof data['metadata'] === 'object' && data['metadata'] !== null
+        ? data['metadata'] as Record<string, unknown>
+        : {}),
+    },
+  });
+
+  sendJson(res, 201, {
+    data: {
+      usage_record: result.usage_record,
+      ledger_entry: {
+        entry_id: result.ledger_entry.entry_id,
+        entry_type: result.ledger_entry.entry_type,
+        amount: result.ledger_entry.amount,
+        balance_after: result.ledger_entry.balance_after,
+      },
+      stripe_emitted: result.stripe_emitted,
+    },
+    principal: authContext.principal.email,
+    organization_id: authContext.organization_id,
+  });
+}
+
+/**
+ * POST /v1/lifecycle/deployment-completed
+ * Lifecycle binding: Record completed deployment with usage tracking,
+ * cost attribution, and billing ledger update.
+ *
+ * SECURITY: Requires Cloud Run IAM authentication
+ * - org_id is resolved from authenticated principal (NEVER from client)
+ *
+ * Required body fields:
+ * - command_name: string (e.g., "deploy:run", "deploy:preview")
+ * - success: boolean
+ *
+ * Optional body fields:
+ * - token_usage: { input_tokens, output_tokens, total_tokens, model? }
+ * - credits_used: number
+ * - execution_time_ms: number
+ * - environment: string (e.g., "staging", "production")
+ * - service: string
+ * - run_id: string
+ * - correlation_id: string
+ * - idempotency_key: string
+ * - metadata: object
+ */
+async function handleDeploymentCompletedEvent(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  // Require authentication
+  const authContext = await requireAuth(req, res);
+  if (!authContext) return;
+
+  const body = parseJsonBody(await readBody(req));
+  if (typeof body !== 'object' || body === null) {
+    throw invalidRequest('Request body must be an object');
+  }
+
+  const data = body as Record<string, unknown>;
+
+  // Validate required fields
+  if (!data['command_name'] || typeof data['command_name'] !== 'string') {
+    throw invalidRequest('command_name is required and must be a string');
+  }
+  if (typeof data['success'] !== 'boolean') {
+    throw invalidRequest('success is required and must be a boolean');
+  }
+
+  // Parse optional token_usage
+  let tokenUsage: { input_tokens: number; output_tokens: number; total_tokens: number; model?: string } | undefined;
+  if (data['token_usage'] && typeof data['token_usage'] === 'object') {
+    const tu = data['token_usage'] as Record<string, unknown>;
+    if (typeof tu['input_tokens'] !== 'number' || typeof tu['output_tokens'] !== 'number') {
+      throw invalidRequest('token_usage.input_tokens and token_usage.output_tokens must be numbers');
+    }
+    tokenUsage = {
+      input_tokens: tu['input_tokens'] as number,
+      output_tokens: tu['output_tokens'] as number,
+      total_tokens: typeof tu['total_tokens'] === 'number'
+        ? tu['total_tokens']
+        : (tu['input_tokens'] as number) + (tu['output_tokens'] as number),
+      model: typeof tu['model'] === 'string' ? tu['model'] : undefined,
+    };
+  }
+
+  const result = await handleDeploymentCompleted({
+    organization_id: authContext.organization_id,
+    user_id: authContext.principal.email,
+    command_name: data['command_name'] as string,
+    success: data['success'] as boolean,
+    token_usage: tokenUsage,
+    credits_used: typeof data['credits_used'] === 'number' ? data['credits_used'] : undefined,
+    execution_time_ms: typeof data['execution_time_ms'] === 'number' ? data['execution_time_ms'] : undefined,
+    environment: typeof data['environment'] === 'string' ? data['environment'] : undefined,
+    service: typeof data['service'] === 'string' ? data['service'] : undefined,
+    run_id: typeof data['run_id'] === 'string' ? data['run_id'] : undefined,
+    correlation_id: typeof data['correlation_id'] === 'string' ? data['correlation_id'] : undefined,
+    idempotency_key: typeof data['idempotency_key'] === 'string' ? data['idempotency_key'] : undefined,
+    metadata: {
+      principal: authContext.principal.email,
+      principal_subject: authContext.principal.subject,
+      mapping_source: authContext.mapping_source,
+      ...(typeof data['metadata'] === 'object' && data['metadata'] !== null
+        ? data['metadata'] as Record<string, unknown>
+        : {}),
+    },
+  });
+
+  sendJson(res, 201, {
+    data: {
+      usage_record: result.usage_record,
+      ledger_entry: {
+        entry_id: result.ledger_entry.entry_id,
+        entry_type: result.ledger_entry.entry_type,
+        amount: result.ledger_entry.amount,
+        balance_after: result.ledger_entry.balance_after,
+      },
+      stripe_emitted: result.stripe_emitted,
+    },
+    principal: authContext.principal.email,
+    organization_id: authContext.organization_id,
+  });
+}
+
+// ============================================================================
 // Usage Query Handlers (UI Backend - IAM-secured)
 // ============================================================================
 
@@ -1287,6 +1505,17 @@ export async function handleRequest(
 
     if (method === 'GET' && ROUTES.entitledCommandsList.test(path)) {
       await handleListEntitledCommands(req, res);
+      return;
+    }
+
+    // Lifecycle Event Endpoints
+    if (method === 'POST' && ROUTES.executionCompleted.test(path)) {
+      await handleExecutionCompletedEvent(req, res);
+      return;
+    }
+
+    if (method === 'POST' && ROUTES.deploymentCompleted.test(path)) {
+      await handleDeploymentCompletedEvent(req, res);
       return;
     }
 

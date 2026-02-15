@@ -303,3 +303,95 @@ export interface StripeHealthStatus {
   connected: boolean;
   error?: string;
 }
+
+// ============================================================================
+// Lifecycle Event Types
+// ============================================================================
+
+/**
+ * Token usage breakdown for AI executions
+ */
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  model?: string;
+}
+
+/**
+ * Lifecycle event: execution_completed
+ * Fired when an AI execution (command, agent run, etc.) completes.
+ * Triggers token usage recording, cost attribution, and billing ledger update.
+ */
+export interface ExecutionCompletedEvent {
+  /** Organization ID (resolved from auth, not client-supplied) */
+  organization_id: string;
+  /** User/principal who initiated the execution */
+  user_id?: string;
+  /** Command or operation that was executed */
+  command_name: string;
+  /** Whether the execution succeeded */
+  success: boolean;
+  /** Token usage breakdown */
+  token_usage: TokenUsage;
+  /** Credits consumed (if omitted, computed from token_usage + command weight) */
+  credits_used?: number;
+  /** Execution duration in milliseconds */
+  execution_time_ms?: number;
+  /** Service that produced the execution */
+  service?: string;
+  /** Run/session identifier for correlation */
+  run_id?: string;
+  /** Correlation ID for distributed tracing */
+  correlation_id?: string;
+  /** Idempotency key to prevent duplicate processing */
+  idempotency_key?: string;
+  /** Additional metadata */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Lifecycle event: deployment_completed
+ * Fired when a deployment operation completes.
+ * Triggers usage recording, cost attribution, and billing ledger update.
+ */
+export interface DeploymentCompletedEvent {
+  /** Organization ID (resolved from auth, not client-supplied) */
+  organization_id: string;
+  /** User/principal who initiated the deployment */
+  user_id?: string;
+  /** Deployment command (e.g., deploy:run, deploy:preview, deploy:rollback) */
+  command_name: string;
+  /** Whether the deployment succeeded */
+  success: boolean;
+  /** Token usage if AI was involved in deployment */
+  token_usage?: TokenUsage;
+  /** Credits consumed */
+  credits_used?: number;
+  /** Deployment duration in milliseconds */
+  execution_time_ms?: number;
+  /** Target environment (e.g., staging, production) */
+  environment?: string;
+  /** Service being deployed */
+  service?: string;
+  /** Deployment/release identifier */
+  run_id?: string;
+  /** Correlation ID for distributed tracing */
+  correlation_id?: string;
+  /** Idempotency key to prevent duplicate processing */
+  idempotency_key?: string;
+  /** Additional metadata */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Result of lifecycle event processing
+ */
+export interface LifecycleEventResult {
+  /** Usage record from command_usage table */
+  usage_record: CommandUsageRecord;
+  /** Ledger entry from ledger_entries table (billing debit) */
+  ledger_entry: LedgerEntry;
+  /** Whether Stripe meter event was emitted */
+  stripe_emitted: boolean;
+}
