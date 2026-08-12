@@ -85,19 +85,34 @@ export async function closeDb(): Promise<void> {
 export async function withTransaction<T>(
   fn: (client: PoolClient) => Promise<T>
 ): Promise<T> {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const client = await getPool().connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      const code = (error as { code?: string }).code;
+      if (!['40001', '40P01'].includes(code || '') || attempt === 11) throw error;
+      await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * Math.min(100, 2 ** attempt))));
+    } finally {
+      client.release();
+    }
+  }
+  throw new Error('SERIALIZABLE_RETRY_EXHAUSTED');
+}
+
+/** Acquires the authority aggregate lock before SERIALIZABLE establishes a snapshot. */
+export async function withOrganizationTransaction<T>(organizationId: string, fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await getPool().connect();
   try {
-    // Use SERIALIZABLE isolation for ledger operations per SPARC Section 4.1.1
+    await client.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [organizationId]);
     await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
+    const result = await fn(client); await client.query('COMMIT'); return result;
+  } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; }
+  finally { await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [organizationId]).catch(() => undefined); client.release(); }
 }
 
 /**

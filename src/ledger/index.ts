@@ -42,10 +42,12 @@ import {
   entitlementSuspended,
   dailyLimitExceeded,
   monthlyLimitExceeded,
+  duplicateIdempotencyKey,
 } from '../errors/index.js';
 
 import {
   withTransaction,
+  withOrganizationTransaction,
   getOrganization,
   getEntryByIdempotencyKey,
   getEntryById,
@@ -323,7 +325,7 @@ export async function reserveCredits(req: ReserveRequest): Promise<Reservation> 
     throw invalidAmount('ttl_seconds must be between 1 and 86400');
   }
 
-  return withTransaction(async (client) => {
+  return withOrganizationTransaction(req.organization_id, async (client) => {
     // Idempotency check
     const existing = await getReservationByIdempotencyKey(
       req.organization_id,
@@ -331,6 +333,7 @@ export async function reserveCredits(req: ReserveRequest): Promise<Reservation> 
       client
     );
     if (existing) {
+      if (existing.amount !== amount.toFixed(6) || existing.user_id !== (req.user_id || null)) throw duplicateIdempotencyKey(req.idempotency_key);
       return existing;
     }
 
